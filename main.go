@@ -1,12 +1,14 @@
 //go:build windows
 
-// frpc-gui: FRP 客户端图形界面启动器（单文件 EXE，内嵌 frpc.exe）
+// frpc-gui: FRP 客户端图形界面启动器
+//
+// 设计：本程序【不携带、不释放】frpc.exe，只负责生成配置并调用用户指定的 frpc.exe。
+// 这样可避免杀软把「内嵌 PE + 运行时释放执行」误判成木马释放器。
 //
 // 构建: go build -ldflags "-H windowsgui -s -w" -o frpc-gui.exe
 package main
 
 import (
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -21,9 +23,6 @@ import (
 	"time"
 	"unsafe"
 )
-
-//go:embed frpc.exe
-var frpcBin []byte
 
 const (
 	appName = "FRP 客户端启动器"
@@ -62,9 +61,11 @@ const (
 	colorWindow = 5
 
 	idAddr, idSport, idToken = 1001, 1002, 1003
+	idFrpc                   = 1004
 
 	idAdd, idEditBtn, idDelBtn, idUp, idDown = 2005, 2006, 2007, 2008, 2009
 	idStart, idStop, idShow, idClear         = 2001, 2002, 2003, 2004
+	idBrowse                                 = 2010
 	idLog, idStatus, idProxy, idList         = 3001, 3002, 3003, 3004
 )
 
@@ -161,10 +162,181 @@ var (
 
 	comctl32         = syscall.NewLazyDLL("comctl32.dll")
 	pInitCommonCtrls = comctl32.NewProc("InitCommonControlsEx")
+
+	comdlg32      = syscall.NewLazyDLL("comdlg32.dll")
+	pGetOpenFileW = comdlg32.NewProc("GetOpenFileNameW")
+	pCommDlgExtErr = comdlg32.NewProc("CommDlgExtendedError")
+
+	ole32           = syscall.NewLazyDLL("ole32.dll")
+	pOleInitialize  = ole32.NewProc("OleInitialize")
+
+	shell32         = syscall.NewLazyDLL("shell32.dll")
+	pDragAcceptFile = shell32.NewProc("DragAcceptFiles")
+	pDragQueryFileW = shell32.NewProc("DragQueryFileW")
+	pDragFinish     = shell32.NewProc("DragFinish")
+)
+
+// enableDragDrop 让主窗口接受文件拖入（拖 frpc.exe 进来即可设置路径）
+func enableDragDrop(hwnd syscall.Handle) {
+	pDragAcceptFile.Call(uintptr(hwnd), 1)
+}
+
+// onDropFiles 处理 WM_DROPFILES：取第一个拖入的文件
+func onDropFiles(hDrop uintptr) {
+	n, _, _ := pDragQueryFileW.Call(hDrop, ^uintptr(0), 0, 0)
+	if n == 0 {
+		pDragFinish.Call(hDrop)
+		return
+	}
+	buf := make([]uint16, 1024)
+	pDragQueryFileW.Call(hDrop, 0, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	pDragFinish.Call(hDrop)
+	p := syscall.UTF16ToString(buf)
+	if p == "" {
+		return
+	}
+	applyFrpcPath(p)
+}
+
+// OPENFILENAMEW：必须与 Win32 内存布局严格一致（64 位）
+type openFileNameW struct {
+	lStructSize       uint32
+	hwndOwner         syscall.Handle
+	hInstance         syscall.Handle
+	lpstrFilter       *uint16
+	lpstrCustomFilter *uint16
+	nMaxCustFilter    uint32
+	nFilterIndex      uint32
+	lpstrFile         *uint16
+	nMaxFile          uint32
+	lpstrInitialDir   *uint16
+	lpstrTitle        *uint16
+	flags             uint32
+	nFileOffset       uint16
+	nFileExtension    uint16
+	lpstrDefExt       *uint16
+	lCustData         uintptr
+	lpfnHook         uintptr
+	lpTemplateName    *uint16
+	pvReserved        uintptr
+	dwReserved        uint32
+	flagsEx           uint32
+}
+
+const (
+	ofnReadOnly     = 0x00000001
+	ofnNoChangeDir  = 0x00000008
+	ofnPathMustExist = 0x00000800
+	ofnFileMustExist = 0x00001000
+	ofnExplorer     = 0x00080000
+)
+
+// appendUTF16 手写 UTF-16 编码：不能走 syscall.UTF16FromString，
+// 因为它遇到字符串里的 NUL 会返回 EINVAL（过滤器串必须内嵌 NUL）。
+func appendUTF16(dst []uint16, s string) []uint16 {
+	for _, r := range s {
+		if r < 0x10000 {
+			dst = append(dst, uint16(r))
+		} else {
+			r -= 0x10000
+			dst = append(dst, uint16(0xD800+(r>>10)), uint16(0xDC00+(r&0x3FF)))
+		}
+	}
+	return dst
+}
+
+// buildFilter 拼过滤器：形如  "名称\0*.exe\0名称\0*.*\0\0"
+func buildFilter(pairs [][2]string) []uint16 {
+	var f []uint16
+	for _, p := range pairs {
+		f = appendUTF16(f, p[0])
+		f = append(f, 0)
+		f = appendUTF16(f, p[1])
+		f = append(f, 0)
+	}
+	return append(f, 0) // 结尾必须是额外的 NUL
+}
+
+// pickExeFile 弹出系统「打开文件」对话框。
+// 返回 ("路径", nil) 表示选好；("", nil) 表示用户取消；
+// ("", err) 表示对话框本身打不开（可由安全软件拦截导致）。
+//
+// 注意：过滤器串必须内嵌 NUL，而 syscall.UTF16PtrFromString 遇到 NUL 会返回
+// EINVAL。早期版本忽略了该错误，导致 lpstrFilter 变成 nil —— 这是对话框打不开的主因。
+// 因此这里统一用 appendUTF16 手工编码。
+func pickExeFile(owner syscall.Handle, initDir string) (string, error) {
+	const bufLen = 1024
+	buf := make([]uint16, bufLen)
+
+	filter := buildFilter([][2]string{
+		{"frpc 可执行文件 (frpc.exe)", "frpc.exe"},
+		{"所有可执行文件 (*.exe)", "*.exe"},
+		{"所有文件 (*.*)", "*.*"},
+	})
+
+	title := append(appendUTF16(nil, "请选择 frpc.exe"), 0)
+	defExt := append(appendUTF16(nil, "exe"), 0)
+
+	var dir []uint16
+	if initDir != "" {
+		dir = append(appendUTF16(dir, initDir), 0)
+	}
+	var dirPtr *uint16
+	if len(dir) > 0 {
+		dirPtr = &dir[0]
+	}
+
+	ofn := openFileNameW{
+		lStructSize:     uint32(unsafe.Sizeof(openFileNameW{})),
+		hwndOwner:       owner,
+		lpstrFilter:     &filter[0],
+		lpstrFile:       &buf[0],
+		nMaxFile:        bufLen,
+		lpstrInitialDir: dirPtr,
+		lpstrTitle:      &title[0],
+		lpstrDefExt:     &defExt[0],
+		flags: ofnExplorer | ofnFileMustExist | ofnPathMustExist |
+			ofnNoChangeDir | ofnReadOnly,
+	}
+
+	// 文件对话框内部会用到 shell/COM，先初始化
+	pOleInitialize.Call(0)
+
+	ok, _, _ := pGetOpenFileW.Call(uintptr(unsafe.Pointer(&ofn)))
+
+	// 这些缓冲必须活到调用返回之后
+	runtime.KeepAlive(buf)
+	runtime.KeepAlive(filter)
+	runtime.KeepAlive(title)
+	runtime.KeepAlive(defExt)
+	runtime.KeepAlive(dir)
+	runtime.KeepAlive(ofn)
+
+	if ok != 0 {
+		return syscall.UTF16ToString(buf), nil
+	}
+
+	// 返回 0 有两种可能：用户点了取消，或对话框初始化失败。
+	// CommDlgExtendedError 非 0 说明是后一种，必须告诉用户，不能静默无反应。
+	if cde, _, _ := pCommDlgExtErr.Call(); cde != 0 {
+		return "", fmt.Errorf("文件对话框打开失败（错误码 %d）", cde)
+	}
+	return "", nil // 用户取消
+}
+
+// 公共控件类别位
+const (
+	iccWin95Classes    = 0x000000FF // 动画/列表/树/进度/状态栏/标签/工具提示等
+	iccStandardClasses = 0x00004000 // 按钮/编辑框/静态框/列表框/组合框/滚动条
 )
 
 func initCommonControls() {
-	e := initCommonControlsEx{size: uint32(unsafe.Sizeof(initCommonControlsEx{})), icc: iccListView}
+	// 「打开文件」对话框在 Explorer 模式下会用到 ListView / TreeView / 按钮等，
+	// 只加载 ICC_LISTVIEW_CLASSES 不够，可能导致 CDERR_INITIALIZATION。
+	e := initCommonControlsEx{
+		size: uint32(unsafe.Sizeof(initCommonControlsEx{})),
+		icc:  iccWin95Classes | iccStandardClasses,
+	}
 	pInitCommonCtrls.Call(uintptr(unsafe.Pointer(&e)))
 }
 
@@ -274,6 +446,7 @@ type config struct {
 	ServerAddr string   `json:"server_addr"`
 	ServerPort string   `json:"server_port"`
 	Token      string   `json:"token"`
+	FrpcPath   string   `json:"frpc_path"` // 用户选择的 frpc.exe 路径
 	Proxies    []*proxy `json:"proxies"`
 }
 
@@ -379,7 +552,7 @@ func (c *config) uniqueName(base string) string {
 
 var (
 	hMain, hLog, hStatus, hProxyInfo               syscall.Handle
-	hAddr, hSport, hToken                          syscall.Handle
+	hAddr, hSport, hToken, hFrpc                   syscall.Handle
 	hList                                          syscall.Handle
 	hStart, hStop                                  syscall.Handle
 
@@ -508,17 +681,48 @@ func saveCfg(c *config) {
 	}
 }
 
-// extractFrpc 把内嵌的 frpc.exe 释放到程序自己的运行目录
-func extractFrpc() (string, error) {
-	dir := W()
-	p := filepath.Join(dir, "frpc.exe")
-	if st, err := os.Stat(p); err == nil && st.Size() == int64(len(frpcBin)) {
-		return p, nil
+// findFrpcAuto 自动探测 frpc.exe：exe 同级 → 同级 frp 子目录 → PATH
+func findFrpcAuto() string {
+	base := exeDir()
+	cands := []string{
+		filepath.Join(base, "frpc.exe"),
+		filepath.Join(base, "frp", "frpc.exe"),
+		filepath.Join(base, "..", "frpc.exe"),
 	}
-	if err := os.WriteFile(p, frpcBin, 0o755); err != nil {
-		return "", err
+	// 复用已保存的路径
+	if p := loadCfg().FrpcPath; p != "" {
+		cands = append([]string{p}, cands...)
 	}
-	return p, nil
+	for _, c := range cands {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			abs, _ := filepath.Abs(c)
+			return abs
+		}
+	}
+	// 最后尝试 PATH
+	if p, err := exec.LookPath("frpc.exe"); err == nil {
+		return p
+	}
+	return ""
+}
+
+// checkFrpcFile 校验选中的文件是不是可用的 frpc
+func checkFrpcFile(p string) error {
+	st, err := os.Stat(p)
+	if err != nil {
+		return fmt.Errorf("文件不存在：%s", p)
+	}
+	if st.IsDir() {
+		return fmt.Errorf("这是一个目录，不是文件：%s", p)
+	}
+	if !strings.EqualFold(filepath.Ext(p), ".exe") {
+		return fmt.Errorf("请选择 frpc.exe 文件")
+	}
+	// 大小写个下限，避免误选到同名小文件
+	if st.Size() < 1<<20 {
+		return fmt.Errorf("文件太小（%.1f MB），不像 frpc.exe", float64(st.Size())/(1<<20))
+	}
+	return nil
 }
 
 // tomlPath 生成配置文件的路径
@@ -562,10 +766,17 @@ func collect() (*config, error) {
 		ServerAddr: strings.TrimSpace(getText(hAddr)),
 		ServerPort: getText(hSport),
 		Token:      getText(hToken),
+		FrpcPath:   strings.TrimSpace(getText(hFrpc)),
 		Proxies:    proxies,
 	}
 	if c.ServerAddr == "" {
 		return nil, fmt.Errorf("服务器 IP 不能为空")
+	}
+	if c.FrpcPath == "" {
+		return nil, fmt.Errorf("请先选择 frpc.exe 的位置")
+	}
+	if err := checkFrpcFile(c.FrpcPath); err != nil {
+		return nil, err
 	}
 	var err error
 	if c.ServerPort, err = validatePort(c.ServerPort, "服务器端口"); err != nil {
@@ -617,12 +828,7 @@ func startFrpc() {
 	}
 	saveCfg(c)
 
-	exe, err := extractFrpc()
-	if err != nil {
-		msgBox("释放 frpc.exe 失败：\r\n"+err.Error(), 0x10)
-		return
-	}
-
+	exe := c.FrpcPath
 	cfgFile := tomlPath()
 	if err := os.WriteFile(cfgFile, []byte(buildToml(c)), 0o644); err != nil {
 		msgBox("写入配置失败：\r\n"+err.Error(), 0x10)
@@ -753,8 +959,13 @@ func toggleToken() {
 	pUpdateWindow.Call(uintptr(hToken))
 }
 
+const wmDropFiles = 0x0233
+
 func wndProc(hwnd syscall.Handle, m uint32, w, l uintptr) uintptr {
 	switch m {
+	case wmDropFiles:
+		onDropFiles(w)
+		return 0
 	case wmCommand:
 		switch int(w & 0xffff) {
 		case idStart:
@@ -765,6 +976,8 @@ func wndProc(hwnd syscall.Handle, m uint32, w, l uintptr) uintptr {
 			toggleToken()
 		case idClear:
 			setText(hLog, "")
+		case idBrowse:
+			onBrowseFrpc()
 		case idAdd:
 			onAddProxy()
 		case idEditBtn:
@@ -865,6 +1078,61 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
+// onBrowseFrpc 让用户选择 frpc.exe 的位置
+func onBrowseFrpc() {
+	cur := strings.TrimSpace(getText(hFrpc))
+	initDir := ""
+	if cur != "" {
+		initDir = filepath.Dir(cur)
+	} else {
+		initDir = exeDir()
+	}
+	// 优先用现代 COM 对话框（IFileOpenDialog）；
+	// 老 API GetOpenFileNameW 在 Win11 24H2 上实测打不开，仅作兜底。
+	p, err := pickExeFileModern(hMain, "请选择 frpc.exe")
+	if err != nil {
+
+		log("[警告] 现代文件对话框不可用，改用备用方式: " + err.Error())
+		p, err = pickExeFile(hMain, initDir)
+	}
+	if err != nil {
+		msgBox(err.Error(), 0x30)
+		return
+	}
+	if p == "" {
+		return // 用户取消
+	}
+	applyFrpcPath(p)
+}
+
+// applyFrpcPath 校验并采用一个 frpc.exe 路径（浏览、拖拽共用）
+func applyFrpcPath(p string) {
+	if err := checkFrpcFile(p); err != nil {
+		msgBox(err.Error(), 0x10)
+		return
+	}
+	setText(hFrpc, p)
+	log("[已选择] frpc.exe → " + p)
+	// 立即记住，下次直接可用
+	if c := collectQuiet(); c != nil {
+		saveCfg(c)
+	}
+}
+
+// collectQuiet 读取当前界面值但忽略校验错误，用于仅保存配置
+func collectQuiet() *config {
+	if hAddr == 0 {
+		return nil
+	}
+	return &config{
+		ServerAddr: strings.TrimSpace(getText(hAddr)),
+		ServerPort: strings.TrimSpace(getText(hSport)),
+		Token:      getText(hToken),
+		FrpcPath:   strings.TrimSpace(getText(hFrpc)),
+		Proxies:    proxies,
+	}
+}
+
 func pumpQueues() {
 	for {
 		select {
@@ -924,7 +1192,7 @@ func buildUI(inst syscall.Handle) {
 	h, _, err := pCreateWindowExW.Call(0,
 		uintptr(unsafe.Pointer(u16(cls))),
 		uintptr(unsafe.Pointer(u16(appName))),
-		style, 60, 60, 700, 660, 0, 0, uintptr(inst), 0)
+		style, 60, 60, 700, 730, 0, 0, uintptr(inst), 0)
 	hMain = syscall.Handle(h)
 	if hMain == 0 {
 		msgBox("窗口创建失败: "+err.Error(), 0x10)
@@ -943,10 +1211,16 @@ func buildUI(inst syscall.Handle) {
 	hToken = mk("EDIT", "", uintptr(wsChild|wsVisible|wsTabStop|wsBorder|esAutoHScroll|esPassword), idToken, 100, 70, 320, 24)
 	mk("BUTTON", "显示", uintptr(wsChild|wsVisible|wsTabStop|bsAutoCheck), idShow, 430, 70, 70, 24)
 
-	// ---- 代理列表 ----
-	mk("BUTTON", "代理列表（可添加多条 TCP）", uintptr(wsChild|wsVisible|bsGroupBox), 0, 14, 122, 660, 190)
+	// ---- frpc.exe 位置（本程序不再内嵌，需用户自行指定）----
+	mk("BUTTON", "frpc.exe 位置", uintptr(wsChild|wsVisible|bsGroupBox), 0, 14, 120, 660, 62)
+	mk("STATIC", "程序路径", uintptr(wsChild|wsVisible), 0, 30, 148, 64, 22)
+	hFrpc = mkInput(100, 144, 430, idFrpc, false)
+	mk("BUTTON", "浏览…", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idBrowse, 540, 143, 86, 26)
 
-	hList = mkNoFont("SysListView32", "", uintptr(wsChild|wsVisible|wsBorder|wsTabStop|lvsReport|lvsShowSel), idList, 28, 148, 632, 120)
+	// ---- 代理列表 ----
+	mk("BUTTON", "代理列表（可添加多条 TCP）", uintptr(wsChild|wsVisible|bsGroupBox), 0, 14, 188, 660, 186)
+
+	hList = mkNoFont("SysListView32", "", uintptr(wsChild|wsVisible|wsBorder|wsTabStop|lvsReport|lvsShowSel), idList, 28, 214, 632, 116)
 	pSendMessageW.Call(uintptr(hList), lvmSetExtStyle, uintptr(lvsExFullRow|lvsExGrid), uintptr(lvsExFullRow|lvsExGrid))
 	addColumn(0, "名称", 150)
 	addColumn(1, "本地地址", 200)
@@ -954,25 +1228,25 @@ func buildUI(inst syscall.Handle) {
 	addColumn(3, "状态", 150)
 	// 列表内容在窗口显示后填充（见 main），此处不填
 
-	mk("BUTTON", "添加", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idAdd, 28, 274, 80, 30)
-	mk("BUTTON", "修改", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idEditBtn, 114, 274, 80, 30)
-	mk("BUTTON", "删除", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idDelBtn, 200, 274, 80, 30)
-	mk("BUTTON", "上移", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idUp, 286, 274, 70, 30)
-	mk("BUTTON", "下移", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idDown, 362, 274, 70, 30)
+	mk("BUTTON", "添加", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idAdd, 28, 336, 80, 30)
+	mk("BUTTON", "修改", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idEditBtn, 114, 336, 80, 30)
+	mk("BUTTON", "删除", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idDelBtn, 200, 336, 80, 30)
+	mk("BUTTON", "上移", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idUp, 286, 336, 70, 30)
+	mk("BUTTON", "下移", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idDown, 362, 336, 70, 30)
 
 	// ---- 按钮 ----
-	hStart = mk("BUTTON", "保存并启动", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idStart, 18, 320, 120, 34)
-	hStop = mk("BUTTON", "停止", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idStop, 146, 320, 88, 34)
+	hStart = mk("BUTTON", "保存并启动", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idStart, 18, 382, 120, 34)
+	hStop = mk("BUTTON", "停止", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idStop, 146, 382, 88, 34)
 	pEnableWindow.Call(uintptr(hStop), 0)
-	mk("BUTTON", "清空日志", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idClear, 242, 320, 92, 34)
-	hStatus = mk("STATIC", "● 未运行", uintptr(wsChild|wsVisible), idStatus, 570, 330, 100, 22)
-	hProxyInfo = mk("STATIC", "", uintptr(wsChild|wsVisible), idProxy, 346, 330, 216, 22)
+	mk("BUTTON", "清空日志", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idClear, 242, 382, 92, 34)
+	hStatus = mk("STATIC", "● 未运行", uintptr(wsChild|wsVisible), idStatus, 570, 392, 100, 22)
+	hProxyInfo = mk("STATIC", "", uintptr(wsChild|wsVisible), idProxy, 346, 392, 216, 22)
 
 	// ---- 日志 ----
-	mk("STATIC", "日志", uintptr(wsChild|wsVisible), 0, 18, 362, 60, 20)
+	mk("STATIC", "日志", uintptr(wsChild|wsVisible), 0, 18, 424, 60, 20)
 	hLog = mk("EDIT", "",
 		uintptr(wsChild|wsVisible|wsBorder|wsVScroll|esLeft|esMultiline|esAutoHScroll|esReadOnly),
-		idLog, 18, 384, 660, 240)
+		idLog, 18, 446, 660, 190)
 
 	setStatus("● 未运行", false)
 }
@@ -1185,6 +1459,13 @@ func main() {
 	setText(hSport, c.ServerPort)
 	setText(hToken, c.Token)
 
+	// frpc.exe 路径：优先用上次保存的，否则自动探测
+	fp := c.FrpcPath
+	if fp == "" || checkFrpcFile(fp) != nil {
+		fp = findFrpcAuto()
+	}
+	setText(hFrpc, fp)
+
 	proxies = c.Proxies
 	if len(proxies) == 0 {
 		// 首次运行：给一条示例
@@ -1192,9 +1473,15 @@ func main() {
 	}
 
 	log("[就绪] " + appName)
-	log("[说明] 填写服务器 IP 与 Token，用“添加”增加多条代理，然后“保存并启动”。")
-	log("[说明] frpc.exe 已内嵌，无需外部文件。")
+	if fp == "" {
+		log("[提示] 未找到 frpc.exe，请点“浏览…”选择它的位置。")
+		log("[说明] frpc.exe 需自行下载：frp 官方 GitHub Releases（fatedier/frp）。")
+	} else {
+		log("[frpc] " + fp)
+	}
+	log("[说明] 填好服务器 IP 与 Token，用“添加”配置代理，然后“保存并启动”。")
 
+	enableDragDrop(hMain) // 允许把 frpc.exe 拖进窗口
 	pShowWindow.Call(uintptr(hMain), swShow)
 
 	// 必须等窗口真正显示、ListView 完成创建后再填数据，
