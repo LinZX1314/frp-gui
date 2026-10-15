@@ -413,6 +413,9 @@ func setRowStatus(i int, s string) {
 	t := u16(s)
 	it := lvItem{mask: lvifText, iItem: int32(i), iSubItem: 4, pszText: t}
 	pSendMessageW.Call(uintptr(hList), lvmSetItemTextW, uintptr(i), uintptr(unsafe.Pointer(&it)))
+	// 同 log()：pszText 指向的缓冲与 LVITEM 本身都要活到调用结束
+	runtime.KeepAlive(t)
+	runtime.KeepAlive(it)
 }
 
 func resetRowStatus() {
@@ -637,8 +640,8 @@ var (
 
 	logQueue   = make(chan string, 1024)
 	proxyQueue = make(chan string, 64)
-	rowQueue   = make(chan rowMsg, 128)
 	exitQueue  = make(chan int, 8)
+	nameQueue  = make(chan string, 64)
 )
 
 func u16(s string) *uint16 {
@@ -657,12 +660,22 @@ func getText(h syscall.Handle) string {
 }
 
 func setText(h syscall.Handle, s string) {
-	pSetWindowTextW.Call(uintptr(h), uintptr(unsafe.Pointer(u16(s))))
+	// 缓冲要先落到局部变量，再用 KeepAlive 固定到调用结束。
+	// 直接写 unsafe.Pointer(u16(s)) 会把指针转成 uintptr，GC 看不到引用，
+	// 缓冲可能在 Syscall 期间被回收 —— 这种崩溃是随机的，且在堆布局
+	// 被外部因素（如注入 DLL）改变时命中率骤增。
+	p := u16(s)
+	pSetWindowTextW.Call(uintptr(h), uintptr(unsafe.Pointer(p)))
+	runtime.KeepAlive(p)
 }
 
 func msgBox(body string, flags uintptr) {
-	pMessageBoxW.Call(uintptr(hMain), uintptr(unsafe.Pointer(u16(body))),
-		uintptr(unsafe.Pointer(u16(appName))), flags)
+	b := u16(body)
+	a := u16(appName)
+	pMessageBoxW.Call(uintptr(hMain), uintptr(unsafe.Pointer(b)),
+		uintptr(unsafe.Pointer(a)), flags)
+	runtime.KeepAlive(b)
+	runtime.KeepAlive(a)
 }
 
 func getInstance() syscall.Handle {
@@ -671,11 +684,15 @@ func getInstance() syscall.Handle {
 }
 
 func mk(class, text string, style uintptr, id, x, y, w, h int) syscall.Handle {
+	cl := u16(class)
+	tx := u16(text)
 	hw, _, _ := pCreateWindowExW.Call(0,
-		uintptr(unsafe.Pointer(u16(class))),
-		uintptr(unsafe.Pointer(u16(text))),
+		uintptr(unsafe.Pointer(cl)),
+		uintptr(unsafe.Pointer(tx)),
 		style, uintptr(ds(x)), uintptr(ds(y)), uintptr(ds(w)), uintptr(ds(h)),
 		uintptr(hMain), uintptr(id), uintptr(getInstance()), 0)
+	runtime.KeepAlive(cl)
+	runtime.KeepAlive(tx)
 	if hw != 0 && hFont != 0 {
 		pSendMessageW.Call(hw, wmSetFont, hFont, 1)
 	}
@@ -684,11 +701,15 @@ func mk(class, text string, style uintptr, id, x, y, w, h int) syscall.Handle {
 
 // mkNoFont 创建控件但不套用自定义字体（ListView 需要系统默认字体才能正常显示子列）
 func mkNoFont(class, text string, style uintptr, id, x, y, w, h int) syscall.Handle {
+	cl := u16(class)
+	tx := u16(text)
 	hw, _, _ := pCreateWindowExW.Call(0,
-		uintptr(unsafe.Pointer(u16(class))),
-		uintptr(unsafe.Pointer(u16(text))),
+		uintptr(unsafe.Pointer(cl)),
+		uintptr(unsafe.Pointer(tx)),
 		style, uintptr(ds(x)), uintptr(ds(y)), uintptr(ds(w)), uintptr(ds(h)),
 		uintptr(hMain), uintptr(id), uintptr(getInstance()), 0)
+	runtime.KeepAlive(cl)
+	runtime.KeepAlive(tx)
 	return syscall.Handle(hw)
 }
 
@@ -708,7 +729,13 @@ func log(s string) {
 	s = strings.ReplaceAll(s, "\n", "\r\n")
 	cur, _, _ := pSendMessageW.Call(uintptr(hLog), wmGetTextLen, 0, 0)
 	pSendMessageW.Call(uintptr(hLog), emSetSel, cur, cur)
-	pSendMessageW.Call(uintptr(hLog), emReplaceSel, 0, uintptr(unsafe.Pointer(u16(s+"\r\n"))))
+	// 注意：u16 分配的 UTF-16 缓冲必须在本行调用期间保持存活。
+	// 若直接写成 unsafe.Pointer(u16(...))，指针被转成 uintptr 后 GC 就看不到
+	// 引用了，缓冲可能在 SendMessageW 执行途中被回收 —— 表现为随机访问冲突
+	// （堆布局一变就容易命中，例如被注入 DLL 改变分配时序的时候）。
+	line := u16(s + "\r\n")
+	pSendMessageW.Call(uintptr(hLog), emReplaceSel, 0, uintptr(unsafe.Pointer(line)))
+	runtime.KeepAlive(line)
 }
 
 func postLog(s string) {
@@ -1001,24 +1028,32 @@ func trackProxy(line string) {
 			name = line[i+1 : i+j]
 		}
 	}
-	for i, p := range proxies {
-		if p.Name == name {
-			postRow(i, "✔ 已启动")
-			return
-		}
+	if name == "" {
+		return
 	}
+	// 不能在后台线程里遍历 proxies：GUI 线程会并发地增删改它，
+	// 读到撕裂的 slice header 会导致随机访问冲突。
+	// 这里只把名字投递给 GUI 线程，由它去匹配并更新状态。
+	postProxyName(name)
 }
 
-func postRow(i int, s string) {
+// postProxyName 把「某代理已启动」投递给 GUI 线程处理
+func postProxyName(name string) {
 	select {
-	case rowQueue <- rowMsg{i, s}:
+	case nameQueue <- name:
 	default:
 	}
 }
 
-type rowMsg struct {
-	i int
-	s string
+// matchProxyName 在 GUI 线程里按名字找代理行并更新状态。
+// 必须在 GUI 线程调用 —— 后台线程读 proxies 会与 GUI 线程的增删改发生竞态。
+func matchProxyName(name string) {
+	for i, p := range proxies {
+		if p.Name == name {
+			setRowStatus(i, "✔ 已启动")
+			return
+		}
+	}
 }
 
 func stopFrpc() {
@@ -1138,9 +1173,13 @@ func onDeleteProxy() {
 		msgBox("请先在列表中选中一条代理。", 0x40)
 		return
 	}
+	q := u16("确定删除代理 “" + proxies[i].Name + "” 吗？")
+	a := u16(appName)
 	mbRet, _, _ := pMessageBoxW.Call(uintptr(hMain),
-		uintptr(unsafe.Pointer(u16("确定删除代理 “"+proxies[i].Name+"” 吗？"))),
-		uintptr(unsafe.Pointer(u16(appName))), 0x34)
+		uintptr(unsafe.Pointer(q)),
+		uintptr(unsafe.Pointer(a)), 0x34)
+	runtime.KeepAlive(q)
+	runtime.KeepAlive(a)
 	if mbRet != 6 { // IDYES
 		return
 	}
@@ -1238,8 +1277,8 @@ func pumpQueues() {
 		select {
 		case s := <-logQueue:
 			log(s)
-		case m := <-rowQueue:
-			setRowStatus(m.i, m.s)
+		case name := <-nameQueue:
+			matchProxyName(name)
 		case code := <-exitQueue:
 			if code == 0 {
 				log("[退出] frpc 已正常结束")
@@ -1289,10 +1328,14 @@ func buildUI(inst syscall.Handle) {
 	}
 
 	const style = uintptr(wsOverlapped | wsCaption | wsSysMenu | wsVisible | wsMinimize)
+	cl := u16(cls)
+	ti := u16(appName)
 	h, _, err := pCreateWindowExW.Call(0,
-		uintptr(unsafe.Pointer(u16(cls))),
-		uintptr(unsafe.Pointer(u16(appName))),
+		uintptr(unsafe.Pointer(cl)),
+		uintptr(unsafe.Pointer(ti)),
 		style, uintptr(ds(60)), uintptr(ds(60)), uintptr(ds(700)), uintptr(ds(730)), 0, 0, uintptr(inst), 0)
+	runtime.KeepAlive(cl)
+	runtime.KeepAlive(ti)
 	hMain = syscall.Handle(h)
 	if hMain == 0 {
 		msgBox("窗口创建失败: "+err.Error(), 0x10)
@@ -1485,8 +1528,12 @@ func validateEditFields(hwnd syscall.Handle) error {
 }
 
 func msgBoxOwner(owner syscall.Handle, body string, flags uintptr) {
-	pMessageBoxW.Call(uintptr(owner), uintptr(unsafe.Pointer(u16(body))),
-		uintptr(unsafe.Pointer(u16(appName))), flags)
+	b := u16(body)
+	a := u16(appName)
+	pMessageBoxW.Call(uintptr(owner), uintptr(unsafe.Pointer(b)),
+		uintptr(unsafe.Pointer(a)), flags)
+	runtime.KeepAlive(b)
+	runtime.KeepAlive(a)
 }
 
 var (
@@ -1510,21 +1557,29 @@ func showEditDialog(p *proxy) *proxy {
 	y := int(mr.top) + (int(mr.bottom-mr.top)-dh)/2
 
 	style := uintptr(wsOverlapped | wsCaption | wsSysMenu | wsVisible)
+	dc := u16(editCls)
+	dt := u16("代理设置")
 	hw, _, _ := pCreateWindowExW.Call(0,
-		uintptr(unsafe.Pointer(u16(editCls))),
-		uintptr(unsafe.Pointer(u16("代理设置"))),
+		uintptr(unsafe.Pointer(dc)),
+		uintptr(unsafe.Pointer(dt)),
 		style, uintptr(x), uintptr(y), uintptr(dw), uintptr(dh),
 		uintptr(hMain), 0, uintptr(getInstance()), 0)
+	runtime.KeepAlive(dc)
+	runtime.KeepAlive(dt)
 	hwnd := syscall.Handle(hw)
 	if hwnd == 0 {
 		return nil
 	}
 
 	mkc := func(class, text string, st uintptr, id, cx, cy, cw, ch int) syscall.Handle {
+		cl := u16(class)
+		tx := u16(text)
 		r, _, _ := pCreateWindowExW.Call(0,
-			uintptr(unsafe.Pointer(u16(class))), uintptr(unsafe.Pointer(u16(text))),
+			uintptr(unsafe.Pointer(cl)), uintptr(unsafe.Pointer(tx)),
 			st, uintptr(ds(cx)), uintptr(ds(cy)), uintptr(ds(cw)), uintptr(ds(ch)),
 			uintptr(hwnd), uintptr(id), uintptr(getInstance()), 0)
+		runtime.KeepAlive(cl)
+		runtime.KeepAlive(tx)
 		if r != 0 && hFont != 0 {
 			pSendMessageW.Call(r, wmSetFont, hFont, 1)
 		}
@@ -1636,9 +1691,11 @@ func getRect(h syscall.Handle) (rect, error) {
 }
 
 func mkFont(pt int) uintptr {
+	fn := u16("Microsoft YaHei UI")
 	h, _, _ := pCreateFontW.Call(
 		uintptr(int32(-float64(pt)*96.0/72.0*dpiScale)), 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 0, 0,
-		uintptr(unsafe.Pointer(u16("Microsoft YaHei UI"))))
+		uintptr(unsafe.Pointer(fn)))
+	runtime.KeepAlive(fn)
 	return h
 }
 
