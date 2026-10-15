@@ -606,7 +606,7 @@ func mk(class, text string, style uintptr, id, x, y, w, h int) syscall.Handle {
 	hw, _, _ := pCreateWindowExW.Call(0,
 		uintptr(unsafe.Pointer(u16(class))),
 		uintptr(unsafe.Pointer(u16(text))),
-		style, uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+		style, uintptr(ds(x)), uintptr(ds(y)), uintptr(ds(w)), uintptr(ds(h)),
 		uintptr(hMain), uintptr(id), uintptr(getInstance()), 0)
 	if hw != 0 && hFont != 0 {
 		pSendMessageW.Call(hw, wmSetFont, hFont, 1)
@@ -619,7 +619,7 @@ func mkNoFont(class, text string, style uintptr, id, x, y, w, h int) syscall.Han
 	hw, _, _ := pCreateWindowExW.Call(0,
 		uintptr(unsafe.Pointer(u16(class))),
 		uintptr(unsafe.Pointer(u16(text))),
-		style, uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+		style, uintptr(ds(x)), uintptr(ds(y)), uintptr(ds(w)), uintptr(ds(h)),
 		uintptr(hMain), uintptr(id), uintptr(getInstance()), 0)
 	return syscall.Handle(hw)
 }
@@ -1192,7 +1192,7 @@ func buildUI(inst syscall.Handle) {
 	h, _, err := pCreateWindowExW.Call(0,
 		uintptr(unsafe.Pointer(u16(cls))),
 		uintptr(unsafe.Pointer(u16(appName))),
-		style, 60, 60, 700, 730, 0, 0, uintptr(inst), 0)
+		style, uintptr(ds(60)), uintptr(ds(60)), uintptr(ds(700)), uintptr(ds(730)), 0, 0, uintptr(inst), 0)
 	hMain = syscall.Handle(h)
 	if hMain == 0 {
 		msgBox("窗口创建失败: "+err.Error(), 0x10)
@@ -1254,7 +1254,7 @@ func buildUI(inst syscall.Handle) {
 func addColumn(i int, title string, w int) {
 	// LVCF_FMT(0x1) | LVCF_WIDTH(0x2) | LVCF_TEXT(0x4) | LVCF_SUBITEM(0x8) = 0xF
 	t := u16(title)
-	c := lvColumn{mask: 0x000F, fmt: lvcfmtLeft, cx: int32(w), pszText: t, iSubItem: int32(i)}
+	c := lvColumn{mask: 0x000F, fmt: lvcfmtLeft, cx: int32(ds(w)), pszText: t, iSubItem: int32(i)}
 	pSendMessageW.Call(uintptr(hList), lvmInsertColW, uintptr(i), uintptr(unsafe.Pointer(&c)))
 	runtime.KeepAlive(t)   // 保证 title 的 UTF-16 缓冲在调用期间存活
 	runtime.KeepAlive(c)
@@ -1334,7 +1334,7 @@ func showEditDialog(p *proxy) *proxy {
 	dlgOK = false
 	dlgName, dlgLip, dlgLport, dlgRport = 0, 0, 0, 0
 
-	dw, dh := 400, 246
+	dw, dh := ds(400), ds(246)
 	mr, _ := getRect(hMain)
 	x := int(mr.left) + (int(mr.right-mr.left)-dw)/2
 	y := int(mr.top) + (int(mr.bottom-mr.top)-dh)/2
@@ -1353,7 +1353,7 @@ func showEditDialog(p *proxy) *proxy {
 	mkc := func(class, text string, st uintptr, id, cx, cy, cw, ch int) syscall.Handle {
 		r, _, _ := pCreateWindowExW.Call(0,
 			uintptr(unsafe.Pointer(u16(class))), uintptr(unsafe.Pointer(u16(text))),
-			st, uintptr(cx), uintptr(cy), uintptr(cw), uintptr(ch),
+			st, uintptr(ds(cx)), uintptr(ds(cy)), uintptr(ds(cw)), uintptr(ds(ch)),
 			uintptr(hwnd), uintptr(id), uintptr(getInstance()), 0)
 		if r != 0 && hFont != 0 {
 			pSendMessageW.Call(r, wmSetFont, hFont, 1)
@@ -1437,7 +1437,7 @@ func getRect(h syscall.Handle) (rect, error) {
 
 func mkFont(pt int) uintptr {
 	h, _, _ := pCreateFontW.Call(
-		uintptr(int32(-pt*96/72)), 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 0, 0,
+		uintptr(int32(-float64(pt)*96.0/72.0*dpiScale)), 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 0, 0,
 		uintptr(unsafe.Pointer(u16("Microsoft YaHei UI"))))
 	return h
 }
@@ -1448,6 +1448,7 @@ func main() {
 	// GetMessage 永远收不到消息（表现为窗口“未响应”）。
 	runtime.LockOSThread()
 
+	initDPI() // 必须在创建任何窗口/字体之前
 	inst := getInstance()
 	buildUI(inst)
 	if hMain == 0 {
