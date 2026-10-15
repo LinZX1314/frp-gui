@@ -1,0 +1,40 @@
+# ============================================================
+#  frpc-gui  .gitignore
+# ============================================================
+
+# --- 配置文件（含明文 token / 密码，绝对不要提交）---
+config.json
+frpc.toml
+frps.toml
+*.generated.toml
+*config*.json
+*credentials*
+*.secret
+
+# --- 运行时数据目录（程序在 exe 同级生成）---
+frpc-gui-data/
+
+# --- 可执行文件与构建产物 ---
+*.exe
+*.dll
+*.sys
+/dist/
+/build/
+/out/
+
+# --- 日志与临时文件 ---
+*.log
+*.tmp
+*.bak
+*~
+
+# --- 编辑器 / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Windows 系统文件 ---
+Thumbs.db
+desktop.ini
+ehthumbs.db
