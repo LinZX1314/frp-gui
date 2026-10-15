@@ -57,6 +57,9 @@ const (
 	wmCommand    = 0x0111
 	wmGetTextLen = 0x000E
 	wmSetFont    = 0x0030
+	wmDrawItem   = 0x002B
+	wmEraseBkgnd = 0x0014
+	wmNotify     = 0x004E
 
 	colorWindow = 5
 
@@ -65,8 +68,12 @@ const (
 
 	idAdd, idEditBtn, idDelBtn, idUp, idDown = 2005, 2006, 2007, 2008, 2009
 	idStart, idStop, idShow, idClear         = 2001, 2002, 2003, 2004
+	idDark                                   = 2011
 	idBrowse                                 = 2010
 	idLog, idStatus, idProxy, idList         = 3001, 3002, 3003, 3004
+
+	// 自绘按钮样式
+	bsOwnerDraw = 0x0000000B
 )
 
 // ListView / 通用控件消息
@@ -341,17 +348,17 @@ func initCommonControls() {
 }
 
 // lvInsert 插入一行（4 列：名称 / 本地 / 远程 / 状态）
-func lvInsert(idx int, cols [4]string) {
+func lvInsert(idx int, cols [5]string) {
 	// 这些 UTF-16 缓冲区必须存活到 SendMessage 返回之后
-	keep := make([]*uint16, 4)
-	for i := 0; i < 4; i++ {
+	keep := make([]*uint16, 5)
+	for i := 0; i < 5; i++ {
 		keep[i] = u16(cols[i])
 	}
 	defer runtime.KeepAlive(keep)
 
 	// 一次调用写入全部列：LVITEM.iSubItem=0 插行，随后逐列 SetItemText。
 	// 关键：LVITEM 的 a mask 必须是 LVIF_TEXT，且 pszText 指向的缓冲要一直有效。
-	for c := 0; c < 4; c++ {
+	for c := 0; c < 5; c++ {
 		it := lvItem{
 			mask:       lvifText,
 			iItem:      int32(idx),
@@ -383,10 +390,12 @@ func lvSelected() int {
 func refreshList() {
 	lvClear()
 	for i, p := range proxies {
-		lvInsert(i, [4]string{
+		p.setDefaults()
+		lvInsert(i, [5]string{
 			p.Name,
+			p.Type,
 			p.LocalIP + ":" + p.LocalPort,
-			":" + p.RemotePort,
+			p.targetText(),
 			"待启动",
 		})
 	}
@@ -397,7 +406,7 @@ func setRowStatus(i int, s string) {
 		return
 	}
 	t := u16(s)
-	it := lvItem{mask: lvifText, iItem: int32(i), iSubItem: 3, pszText: t}
+	it := lvItem{mask: lvifText, iItem: int32(i), iSubItem: 4, pszText: t}
 	pSendMessageW.Call(uintptr(hList), lvmSetItemTextW, uintptr(i), uintptr(unsafe.Pointer(&it)))
 }
 
@@ -447,20 +456,74 @@ type config struct {
 	ServerPort string   `json:"server_port"`
 	Token      string   `json:"token"`
 	FrpcPath   string   `json:"frpc_path"` // 用户选择的 frpc.exe 路径
+	DarkMode   bool     `json:"dark_mode"` // 深色模式
 	Proxies    []*proxy `json:"proxies"`
 }
 
 // proxy 一条 TCP 代理
 type proxy struct {
 	Name       string `json:"name"`
+	Type       string `json:"type"` // tcp / udp / http / https
 	LocalIP    string `json:"local_ip"`
 	LocalPort  string `json:"local_port"`
-	RemotePort string `json:"remote_port"`
+	RemotePort string `json:"remote_port"` // tcp / udp 用
+	// http / https 用：自定义域名，可多个
+	CustomDomains []string `json:"custom_domains,omitempty"`
+}
+
+// 支持的代理类型
+var proxyTypes = []string{"tcp", "udp", "http", "https"}
+
+func validProxyType(t string) bool {
+	for _, x := range proxyTypes {
+		if x == t {
+			return true
+		}
+	}
+	return false
+}
+
+// useRemotePort 该类型是否用「远程端口」（否则用自定义域名）
+func (p *proxy) useRemotePort() bool {
+	return p.Type == "tcp" || p.Type == "udp"
+}
+
+// domainText 把域名列表拼成逗号分隔的字符串（界面显示用）
+func (p *proxy) domainText() string { return strings.Join(p.CustomDomains, ", ") }
+
+// targetText 列表里「远程端口 / 域名」那一列显示什么
+func (p *proxy) targetText() string {
+	if p.useRemotePort() {
+		return ":" + p.RemotePort
+	}
+	return p.domainText()
+}
+
+// splitDomains 解析逗号/分号/空白分隔的域名串，去重去空
+func splitDomains(s string) []string {
+	f := strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
+	})
+	seen := map[string]bool{}
+	var out []string
+	for _, d := range f {
+		d = strings.TrimSpace(d)
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	return out
 }
 
 func (p *proxy) setDefaults() {
+	if !validProxyType(p.Type) {
+		// 旧配置没有 type 字段，默认 tcp
+		p.Type = "tcp"
+	}
 	if strings.TrimSpace(p.Name) == "" {
-		p.Name = "tcp"
+		p.Name = p.Type
 	}
 	if strings.TrimSpace(p.LocalIP) == "" {
 		p.LocalIP = "127.0.0.1"
@@ -744,10 +807,20 @@ func buildToml(c *config) string {
 	for _, p := range c.Proxies {
 		b.WriteString("\r\n[[proxies]]\r\n")
 		fmt.Fprintf(&b, "name = \"%s\"\r\n", esc(p.Name))
-		b.WriteString("type = \"tcp\"\r\n")
+		fmt.Fprintf(&b, "type = \"%s\"\r\n", esc(p.Type))
 		fmt.Fprintf(&b, "localIP = \"%s\"\r\n", esc(p.LocalIP))
 		fmt.Fprintf(&b, "localPort = %s\r\n", p.LocalPort)
-		fmt.Fprintf(&b, "remotePort = %s\r\n", p.RemotePort)
+		if p.useRemotePort() {
+			// tcp / udp：用远程端口
+			fmt.Fprintf(&b, "remotePort = %s\r\n", p.RemotePort)
+		} else {
+			// http / https：用自定义域名
+			quoted := make([]string, 0, len(p.CustomDomains))
+			for _, d := range p.CustomDomains {
+				quoted = append(quoted, "\""+esc(d)+"\"")
+			}
+			fmt.Fprintf(&b, "customDomains = [%s]\r\n", strings.Join(quoted, ", "))
+		}
 	}
 	return b.String()
 }
@@ -767,6 +840,7 @@ func collect() (*config, error) {
 		ServerPort: getText(hSport),
 		Token:      getText(hToken),
 		FrpcPath:   strings.TrimSpace(getText(hFrpc)),
+		DarkMode:   darkMode,
 		Proxies:    proxies,
 	}
 	if c.ServerAddr == "" {
@@ -792,8 +866,15 @@ func collect() (*config, error) {
 		if p.LocalPort, err = validatePort(p.LocalPort, fmt.Sprintf("第 %d 条代理的本地端口", no)); err != nil {
 			return nil, err
 		}
-		if p.RemotePort, err = validatePort(p.RemotePort, fmt.Sprintf("第 %d 条代理的远程端口", no)); err != nil {
-			return nil, err
+		if p.useRemotePort() {
+			if p.RemotePort, err = validatePort(p.RemotePort, fmt.Sprintf("第 %d 条代理的远程端口", no)); err != nil {
+				return nil, err
+			}
+		} else {
+			p.CustomDomains = splitDomains(strings.Join(p.CustomDomains, ","))
+			if len(p.CustomDomains) == 0 {
+				return nil, fmt.Errorf("第 %d 条 %s 代理至少要填一个自定义域名", no, p.Type)
+			}
 		}
 		if seen[p.Name] {
 			return nil, fmt.Errorf("代理名称重复：%s", p.Name)
@@ -957,15 +1038,26 @@ func toggleToken() {
 	// 强制整个客户区重绘，并刷新
 	pInvalidateRect.Call(uintptr(hToken), 0, 1)
 	pUpdateWindow.Call(uintptr(hToken))
+	setCheck(hShowChk, showPwd.Load())
 }
 
 const wmDropFiles = 0x0233
 
-func wndProc(hwnd syscall.Handle, m uint32, w, l uintptr) uintptr {
+func wndProc(hwnd syscall.Handle, m uint32, w uintptr, l unsafe.Pointer) uintptr {
 	switch m {
 	case wmDropFiles:
 		onDropFiles(w)
 		return 0
+	case wmDrawItem:
+		return drawOwnerItem(l)
+	case wmEraseBkgnd:
+		if r := eraseBackground(hwnd, syscall.Handle(w)); r != 0 {
+			return r
+		}
+	case wmCtlColorBtn, wmCtlColorEdit, wmCtlColorListBox, wmCtlColorStatic:
+		if br := ctlColor(m, syscall.Handle(w), l); br != 0 {
+			return br
+		}
 	case wmCommand:
 		switch int(w & 0xffff) {
 		case idStart:
@@ -974,6 +1066,8 @@ func wndProc(hwnd syscall.Handle, m uint32, w, l uintptr) uintptr {
 			go stopFrpc()
 		case idShow:
 			toggleToken()
+		case idDark:
+			onToggleDark()
 		case idClear:
 			setText(hLog, "")
 		case idBrowse:
@@ -1000,7 +1094,7 @@ func wndProc(hwnd syscall.Handle, m uint32, w, l uintptr) uintptr {
 		pPostQuitMessage.Call(0)
 		return 0
 	}
-	r, _, _ := pDefWindowProcW.Call(uintptr(hwnd), uintptr(m), w, l)
+	r, _, _ := pDefWindowProcW.Call(uintptr(hwnd), uintptr(m), w, uintptr(l))
 	return r
 }
 
@@ -1129,6 +1223,7 @@ func collectQuiet() *config {
 		ServerPort: strings.TrimSpace(getText(hSport)),
 		Token:      getText(hToken),
 		FrpcPath:   strings.TrimSpace(getText(hFrpc)),
+		DarkMode:   darkMode,
 		Proxies:    proxies,
 	}
 }
@@ -1209,36 +1304,38 @@ func buildUI(inst syscall.Handle) {
 
 	mk("STATIC", "Token", uintptr(wsChild|wsVisible), 0, 30, 74, 64, 22)
 	hToken = mk("EDIT", "", uintptr(wsChild|wsVisible|wsTabStop|wsBorder|esAutoHScroll|esPassword), idToken, 100, 70, 320, 24)
-	mk("BUTTON", "显示", uintptr(wsChild|wsVisible|wsTabStop|bsAutoCheck), idShow, 430, 70, 70, 24)
+	hShowChk = mk("BUTTON", "显示", uintptr(wsChild|wsVisible|wsTabStop|bsOwnerDraw|0x00000003), idShow, 430, 70, 70, 24)
+	hDarkChk = mk("BUTTON", "深色", uintptr(wsChild|wsVisible|wsTabStop|bsOwnerDraw|0x00000003), idDark, 508, 70, 76, 24)
 
 	// ---- frpc.exe 位置（本程序不再内嵌，需用户自行指定）----
 	mk("BUTTON", "frpc.exe 位置", uintptr(wsChild|wsVisible|bsGroupBox), 0, 14, 120, 660, 62)
 	mk("STATIC", "程序路径", uintptr(wsChild|wsVisible), 0, 30, 148, 64, 22)
 	hFrpc = mkInput(100, 144, 430, idFrpc, false)
-	mk("BUTTON", "浏览…", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idBrowse, 540, 143, 86, 26)
+	mk("BUTTON", "浏览…", uintptr(wsChild|wsVisible|wsTabStop|bsOwnerDraw), idBrowse, 540, 143, 86, 26)
 
 	// ---- 代理列表 ----
 	mk("BUTTON", "代理列表（可添加多条 TCP）", uintptr(wsChild|wsVisible|bsGroupBox), 0, 14, 188, 660, 186)
 
 	hList = mkNoFont("SysListView32", "", uintptr(wsChild|wsVisible|wsBorder|wsTabStop|lvsReport|lvsShowSel), idList, 28, 214, 632, 116)
 	pSendMessageW.Call(uintptr(hList), lvmSetExtStyle, uintptr(lvsExFullRow|lvsExGrid), uintptr(lvsExFullRow|lvsExGrid))
-	addColumn(0, "名称", 150)
-	addColumn(1, "本地地址", 200)
-	addColumn(2, "远程端口", 110)
-	addColumn(3, "状态", 150)
+	addColumn(0, "名称", 120)
+	addColumn(1, "类型", 70)
+	addColumn(2, "本地地址", 150)
+	addColumn(3, "远程端口 / 域名", 190)
+	addColumn(4, "状态", 100)
 	// 列表内容在窗口显示后填充（见 main），此处不填
 
-	mk("BUTTON", "添加", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idAdd, 28, 336, 80, 30)
-	mk("BUTTON", "修改", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idEditBtn, 114, 336, 80, 30)
-	mk("BUTTON", "删除", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idDelBtn, 200, 336, 80, 30)
-	mk("BUTTON", "上移", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idUp, 286, 336, 70, 30)
-	mk("BUTTON", "下移", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idDown, 362, 336, 70, 30)
+	mk("BUTTON", "添加", uintptr(wsChild|wsVisible|wsTabStop|bsOwnerDraw), idAdd, 28, 336, 80, 30)
+	mk("BUTTON", "修改", uintptr(wsChild|wsVisible|wsTabStop|bsOwnerDraw), idEditBtn, 114, 336, 80, 30)
+	mk("BUTTON", "删除", uintptr(wsChild|wsVisible|wsTabStop|bsOwnerDraw), idDelBtn, 200, 336, 80, 30)
+	mk("BUTTON", "上移", uintptr(wsChild|wsVisible|wsTabStop|bsOwnerDraw), idUp, 286, 336, 70, 30)
+	mk("BUTTON", "下移", uintptr(wsChild|wsVisible|wsTabStop|bsOwnerDraw), idDown, 362, 336, 70, 30)
 
 	// ---- 按钮 ----
-	hStart = mk("BUTTON", "保存并启动", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idStart, 18, 382, 120, 34)
-	hStop = mk("BUTTON", "停止", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idStop, 146, 382, 88, 34)
+	hStart = mk("BUTTON", "保存并启动", uintptr(wsChild|wsVisible|wsTabStop|bsOwnerDraw), idStart, 18, 382, 120, 34)
+	hStop = mk("BUTTON", "停止", uintptr(wsChild|wsVisible|wsTabStop|bsOwnerDraw), idStop, 146, 382, 88, 34)
 	pEnableWindow.Call(uintptr(hStop), 0)
-	mk("BUTTON", "清空日志", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), idClear, 242, 382, 92, 34)
+	mk("BUTTON", "清空日志", uintptr(wsChild|wsVisible|wsTabStop|bsOwnerDraw), idClear, 242, 382, 92, 34)
 	hStatus = mk("STATIC", "● 未运行", uintptr(wsChild|wsVisible), idStatus, 570, 392, 100, 22)
 	hProxyInfo = mk("STATIC", "", uintptr(wsChild|wsVisible), idProxy, 346, 392, 216, 22)
 
@@ -1263,26 +1360,73 @@ func addColumn(i int, title string, w int) {
 // ---------------- 代理编辑对话框 ----------------
 
 const (
-	didOK, didCancel                    = 4001, 4002
-	didName, didLip, didLport, didRport = 4003, 4004, 4005, 4006
+	didOK, didCancel                          = 4001, 4002
+	didName, didLip, didLport, didRport       = 4003, 4004, 4005, 4006
+	didType, didDomains                       = 4007, 4008
+	didTypeHint, didRportHint, didDomainsHint = 4009, 4010, 4011
 )
 
 var editCls = "FrpcEditDlg"
 
-func editProc(hwnd syscall.Handle, m uint32, w, l uintptr) uintptr {
+// dlgType 当前对话框里选中的代理类型
+func dlgTypeNow() string {
+	if dlgTypeH == 0 {
+		return "tcp"
+	}
+	// CB_GETCURSEL = 0x0147
+	i, _, _ := pSendMessageW.Call(uintptr(dlgTypeH), 0x0147, 0, 0)
+	if int32(i) < 0 || int(i) >= len(proxyTypes) {
+		return "tcp"
+	}
+	return proxyTypes[i]
+}
+
+// updateDlgEnabled 按类型切换「远程端口」与「自定义域名」两组控件。
+// 两组控件坐标相同，必须真正显示/隐藏而不是只启用/禁用，否则会互相遮挡。
+func updateDlgEnabled() {
+	usePort := dlgTypeNow() == "tcp" || dlgTypeNow() == "udp"
+
+	showCtl(dlgRportHint, usePort)
+	showCtl(dlgRport, usePort)
+	showCtl(dlgDomainsHint, !usePort)
+	showCtl(dlgDomains, !usePort)
+	showCtl(dlgDomainTip, !usePort)
+}
+
+func showCtl(h syscall.Handle, on bool) {
+	if h == 0 {
+		return
+	}
+	cmd := uintptr(0) // SW_HIDE
+	if on {
+		cmd = 5 // SW_SHOW
+	}
+	pShowWindow.Call(uintptr(h), cmd)
+}
+
+func editProc(hwnd syscall.Handle, m uint32, w uintptr, l unsafe.Pointer) uintptr {
 	if m == wmCommand {
 		switch int(w & 0xffff) {
+		case didType:
+			// CBN_SELCHANGE = 1
+			if int(w>>16) == 1 {
+				updateDlgEnabled()
+			}
+			return 0
 		case didOK:
 			if err := validateEditFields(hwnd); err != nil {
 				return 0
 			}
 			// 关键：必须在销毁窗口之前把输入内容读出来
 			dlgResult = proxy{
-				Name:       strings.TrimSpace(getText(dlgName)),
-				LocalIP:    orDefault(strings.TrimSpace(getText(dlgLip)), "127.0.0.1"),
-				LocalPort:  strings.TrimSpace(getText(dlgLport)),
-				RemotePort: strings.TrimSpace(getText(dlgRport)),
+				Name:          strings.TrimSpace(getText(dlgName)),
+				Type:          dlgTypeNow(),
+				LocalIP:       orDefault(strings.TrimSpace(getText(dlgLip)), "127.0.0.1"),
+				LocalPort:     strings.TrimSpace(getText(dlgLport)),
+				RemotePort:    strings.TrimSpace(getText(dlgRport)),
+				CustomDomains: splitDomains(getText(dlgDomains)),
 			}
+			dlgResult.setDefaults()
 			dlgOK = true
 			pDestroyWindow.Call(uintptr(hwnd))
 			return 0
@@ -1296,7 +1440,19 @@ func editProc(hwnd syscall.Handle, m uint32, w, l uintptr) uintptr {
 		pDestroyWindow.Call(uintptr(hwnd))
 		return 0
 	}
-	r, _, _ := pDefWindowProcW.Call(uintptr(hwnd), uintptr(m), w, l)
+	switch m {
+	case wmDrawItem:
+		return drawOwnerItem(l)
+	case wmEraseBkgnd:
+		if r := eraseBackground(hwnd, syscall.Handle(w)); r != 0 {
+			return r
+		}
+	case wmCtlColorBtn, wmCtlColorEdit, wmCtlColorListBox, wmCtlColorStatic:
+		if br := ctlColor(m, syscall.Handle(w), l); br != 0 {
+			return br
+		}
+	}
+	r, _, _ := pDefWindowProcW.Call(uintptr(hwnd), uintptr(m), w, uintptr(l))
 	return r
 }
 
@@ -1309,9 +1465,17 @@ func validateEditFields(hwnd syscall.Handle) error {
 		msgBoxOwner(hwnd, err.Error(), 0x10)
 		return err
 	}
-	if _, err := validatePort(getText(dlgRport), "远程端口"); err != nil {
-		msgBoxOwner(hwnd, err.Error(), 0x10)
-		return err
+	t := dlgTypeNow()
+	if t == "tcp" || t == "udp" {
+		if _, err := validatePort(getText(dlgRport), "远程端口"); err != nil {
+			msgBoxOwner(hwnd, err.Error(), 0x10)
+			return err
+		}
+	} else {
+		if len(splitDomains(getText(dlgDomains))) == 0 {
+			msgBoxOwner(hwnd, t+" 代理需要填写自定义域名", 0x10)
+			return fmt.Errorf("empty domains")
+		}
 	}
 	return nil
 }
@@ -1322,8 +1486,10 @@ func msgBoxOwner(owner syscall.Handle, body string, flags uintptr) {
 }
 
 var (
-	dlgName, dlgLip, dlgLport, dlgRport syscall.Handle
-	dlgOK                               bool
+	dlgName, dlgLip, dlgLport, dlgRport                    syscall.Handle
+	dlgTypeH, dlgDomains, dlgRportHint, dlgDomainsHint     syscall.Handle
+	dlgDomainTip                                           syscall.Handle
+	dlgOK                                                  bool
 	// dlgResult 在窗口销毁【之前】捕获输入框内容。
 	// 若等 pDestroyWindow 之后再 getText，控件已销毁，读回来全是空串。
 	dlgResult proxy
@@ -1334,7 +1500,7 @@ func showEditDialog(p *proxy) *proxy {
 	dlgOK = false
 	dlgName, dlgLip, dlgLport, dlgRport = 0, 0, 0, 0
 
-	dw, dh := ds(400), ds(246)
+	dw, dh := ds(420), ds(280)
 	mr, _ := getRect(hMain)
 	x := int(mr.left) + (int(mr.right-mr.left)-dw)/2
 	y := int(mr.top) + (int(mr.bottom-mr.top)-dh)/2
@@ -1362,28 +1528,58 @@ func showEditDialog(p *proxy) *proxy {
 	}
 
 	es := uintptr(wsChild | wsVisible | wsTabStop | wsBorder | esAutoHScroll)
-	mkc("STATIC", "名称", uintptr(wsChild|wsVisible), 0, 20, 22, 60, 22)
-	dlgName = mkc("EDIT", "", es, didName, 88, 18, 270, 24)
-	mkc("STATIC", "本地 IP", uintptr(wsChild|wsVisible), 0, 20, 60, 60, 22)
-	dlgLip = mkc("EDIT", "", es, didLip, 88, 56, 270, 24)
-	mkc("STATIC", "本地端口", uintptr(wsChild|wsVisible), 0, 20, 98, 60, 22)
-	dlgLport = mkc("EDIT", "", es, didLport, 88, 94, 270, 24)
-	mkc("STATIC", "远程端口", uintptr(wsChild|wsVisible), 0, 20, 136, 60, 22)
-	dlgRport = mkc("EDIT", "", es, didRport, 88, 132, 270, 24)
-	mkc("BUTTON", "确定", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton|0x00000001), didOK, 176, 174, 84, 32)
-	mkc("BUTTON", "取消", uintptr(wsChild|wsVisible|wsTabStop|bsPushButton), didCancel, 268, 174, 84, 32)
 
-	if p != nil {
-		setText(dlgName, p.Name)
-		setText(dlgLip, p.LocalIP)
-		setText(dlgLport, p.LocalPort)
-		setText(dlgRport, p.RemotePort)
-	} else {
-		// 新增时给出可用默认值，避免用户面对一串空框
-		setText(dlgLip, "127.0.0.1")
-		setText(dlgLport, "8080")
-		setText(dlgRport, "8080")
+	// 类型下拉框
+	mkc("STATIC", "类型", uintptr(wsChild|wsVisible), didTypeHint, 20, 22, 60, 22)
+	dlgTypeH = mkc("COMBOBOX", "",
+		uintptr(wsChild|wsVisible|wsTabStop|wsBorder|0x0003|0x0020|0x0200), // CBS_DROPDOWNLIST|CBS_AUTOHSCROLL|CBS_HASSTRINGS
+		didType, 88, 19, 120, 200)
+	for _, t := range proxyTypes {
+		tp := u16(t)
+		pSendMessageW.Call(uintptr(dlgTypeH), 0x0143 /*CB_ADDSTRING*/, 0, uintptr(unsafe.Pointer(tp)))
+		runtime.KeepAlive(tp)
 	}
+
+	mkc("STATIC", "名称", uintptr(wsChild|wsVisible), 0, 230, 22, 40, 22)
+	dlgName = mkc("EDIT", "", es, didName, 272, 19, 120, 24)
+
+	mkc("STATIC", "本地 IP", uintptr(wsChild|wsVisible), 0, 20, 60, 60, 22)
+	dlgLip = mkc("EDIT", "", es, didLip, 88, 57, 304, 24)
+
+	mkc("STATIC", "本地端口", uintptr(wsChild|wsVisible), 0, 20, 98, 60, 22)
+	dlgLport = mkc("EDIT", "", es, didLport, 88, 95, 130, 24)
+
+	dlgRportHint = mkc("STATIC", "远程端口", uintptr(wsChild|wsVisible), didRportHint, 20, 136, 60, 22)
+	dlgRport = mkc("EDIT", "", es, didRport, 88, 133, 130, 24)
+
+	dlgDomainsHint = mkc("STATIC", "自定义域名", uintptr(wsChild|wsVisible), didDomainsHint, 20, 136, 68, 22)
+	dlgDomains = mkc("EDIT", "", es, didDomains, 88, 133, 304, 24)
+
+	dlgDomainTip = mkc("STATIC", "多个域名用逗号分隔",
+		uintptr(wsChild|wsVisible), 0, 88, 162, 304, 20)
+
+	mkc("BUTTON", "确定", uintptr(wsChild|wsVisible|wsTabStop|bsOwnerDraw), didOK, 200, 196, 84, 32)
+	mkc("BUTTON", "取消", uintptr(wsChild|wsVisible|wsTabStop|bsOwnerDraw), didCancel, 300, 196, 84, 32)
+
+	// 回填
+	cur := &proxy{Type: "tcp", LocalIP: "127.0.0.1", LocalPort: "8080", RemotePort: "8080"}
+	if p != nil {
+		cur = p
+	}
+	cur.setDefaults()
+	setText(dlgName, cur.Name)
+	setText(dlgLip, cur.LocalIP)
+	setText(dlgLport, cur.LocalPort)
+	setText(dlgRport, cur.RemotePort)
+	setText(dlgDomains, cur.domainText())
+	// 选中类型
+	for i, t := range proxyTypes {
+		if t == cur.Type {
+			pSendMessageW.Call(uintptr(dlgTypeH), 0x014E /*CB_SETCURSEL*/, uintptr(i), 0)
+			break
+		}
+	}
+	updateDlgEnabled()
 
 	pEnableWindow.Call(uintptr(hMain), 0)
 	pShowWindow.Call(uintptr(hwnd), swShow)
@@ -1470,7 +1666,11 @@ func main() {
 	proxies = c.Proxies
 	if len(proxies) == 0 {
 		// 首次运行：给一条示例
-		proxies = []*proxy{{Name: "test-tcp", LocalIP: "127.0.0.1", LocalPort: "22", RemotePort: "6000"}}
+		proxies = []*proxy{{Name: "test-tcp", Type: "tcp", LocalIP: "127.0.0.1", LocalPort: "22", RemotePort: "6000"}}
+	}
+	// 旧配置没有 type 字段，这里统一补齐，否则列表渲染不出「类型」
+	for _, p := range proxies {
+		p.setDefaults()
 	}
 
 	log("[就绪] " + appName)
@@ -1489,6 +1689,11 @@ func main() {
 	// 否则子列文字会写不进去（只显示第一列）。
 	pUpdateWindow.Call(uintptr(hMain))
 	refreshList()
+
+	// 应用上次保存的主题
+	applyDarkMode(c.DarkMode)
+	setCheck(hDarkChk, c.DarkMode)
+	setCheck(hShowChk, showPwd.Load())
 
 	// 用 PeekMessage 轮询，保证在无消息时也能跑队列刷新（否则界面会像卡死）
 	var m msg
