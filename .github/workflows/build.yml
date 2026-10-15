@@ -1,0 +1,67 @@
+name: build
+
+on:
+  push:
+    branches: [ master, main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # 本程序是纯 Win32 实现（syscall 调用 user32/gdi32/dwmapi 等），
+    # 必须用 Windows 构建，不能在 Linux 上交叉编译。
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 静态检查
+        run: go vet ./...
+
+      - name: 单元测试
+        # 测试里对 frpc 的配置语法校验会在找不到 frpc.exe 时自动跳过
+        run: go test ./... -v
+
+      - name: 构建 exe
+        run: |
+          go build -trimpath -ldflags "-H windowsgui -s -w" -o frpc-gui.exe .
+
+      - name: 显示产物信息
+        run: |
+          $f = Get-Item frpc-gui.exe
+          Write-Host ("产物: {0}  ({1:N2} MB)" -f $f.Name, ($f.Length / 1MB))
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: frpc-gui
+          path: frpc-gui.exe
+          if-no-files-found: error
+
+      - name: 发布 Release
+        # 只有推送 v* 标签时才发布
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: frpc-gui.exe
+          generate_release_notes: true
+          body: |
+            ## 使用说明
+
+            1. 下载下面的 `frpc-gui.exe`
+            2. 到 [frp 官方 Releases](https://github.com/fatedier/frp/releases) 下载 `frpc.exe`，与本程序放在同一目录
+            3. 双击运行，填写服务器 IP 与 Token，添加代理后点「保存并启动」
+
+            详细说明见 [README](https://github.com/${{ github.repository }}#readme)。
