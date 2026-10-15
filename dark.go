@@ -108,6 +108,7 @@ type drawItemStruct struct {
 }
 
 const (
+	odtButton   = 4
 	odsSelected = 0x0001
 	odsDisabled = 0x0004
 
@@ -129,6 +130,11 @@ func drawOwnerItem(l unsafe.Pointer) uintptr {
 		return 0
 	}
 	dis := (*drawItemStruct)(l)
+	// 只处理按钮（ODT_BUTTON=4）。下拉框等其它控件若也发 WM_DRAWITEM，
+	// 必须交回系统绘制，否则所有项会被画成同一内容。
+	if dis.ctlType != odtButton {
+		return 0
+	}
 	initDarkResources()
 
 	// 复选框与普通按钮共用绘制，只在文字前加一个勾选符号

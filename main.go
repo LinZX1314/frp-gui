@@ -74,6 +74,11 @@ const (
 
 	// 自绘按钮样式
 	bsOwnerDraw = 0x0000000B
+
+	// 下拉框样式
+	cbsDropDownList     = 0x0003
+	cbsHasStrings       = 0x0200
+	cbsNoIntegralHeight = 0x0400
 )
 
 // ListView / 通用控件消息
@@ -1408,10 +1413,9 @@ func editProc(hwnd syscall.Handle, m uint32, w uintptr, l unsafe.Pointer) uintpt
 	if m == wmCommand {
 		switch int(w & 0xffff) {
 		case didType:
-			// CBN_SELCHANGE = 1
-			if int(w>>16) == 1 {
-				updateDlgEnabled()
-			}
+			// 下拉框会发多种通知（CBN_SELCHANGE 等），这里不挑通知码，
+			// 一律刷新一次，避免漏掉导致切换没反应
+			updateDlgEnabled()
 			return 0
 		case didOK:
 			if err := validateEditFields(hwnd); err != nil {
@@ -1532,7 +1536,7 @@ func showEditDialog(p *proxy) *proxy {
 	// 类型下拉框
 	mkc("STATIC", "类型", uintptr(wsChild|wsVisible), didTypeHint, 20, 22, 60, 22)
 	dlgTypeH = mkc("COMBOBOX", "",
-		uintptr(wsChild|wsVisible|wsTabStop|wsBorder|0x0003|0x0020|0x0200), // CBS_DROPDOWNLIST|CBS_AUTOHSCROLL|CBS_HASSTRINGS
+		uintptr(wsChild|wsVisible|wsTabStop|wsBorder|cbsDropDownList|cbsHasStrings|cbsNoIntegralHeight),
 		didType, 88, 19, 120, 200)
 	for _, t := range proxyTypes {
 		tp := u16(t)
